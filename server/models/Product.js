@@ -1,52 +1,73 @@
 const mongoose = require('mongoose');
-const slug = require('slugs');
-const validator = require('validator');
 
 const productSchema = new mongoose.Schema({
   name: {
     type: String,
-    trim: true,
-    validate: [validator.isAscii, 'Illegal characters in product name'],
-    required: 'Please enter a product name.'
-  },
-  slug: String,
-  price: Number,
-  description: {
-    type: String,
+    required: [true, 'Product name is required'],
     trim: true
   },
-  created: {
-    type: Date,
-    default: Date.now
+  description: {
+    type: String,
+    required: [true, 'Product description is required']
   },
-  photo: String
-});
-
-productSchema.index({
-  name: 'text',
-  description: 'text'
-});
-
-productSchema.pre('save', async function(next) {
-  if (!this.isModified('name')) {
-    return next();
+  price: {
+    type: Number,
+    required: [true, 'Product price is required'],
+    min: 0
+  },
+  category: {
+    type: String,
+    required: [true, 'Product category is required'],
+    enum: ['flowers', 'paints']
+  },
+  subCategory: {
+    type: String,
+    required: false
+  },
+  stock: {
+    type: Number,
+    required: true,
+    min: 0,
+    default: 0
+  },
+  images: [{
+    type: String
+  }],
+  colors: [{
+    type: String
+  }],
+  sizes: [{
+    type: String
+  }],
+  rating: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 5
+  },
+  numReviews: {
+    type: Number,
+    default: 0
+  },
+  isActive: {
+    type: Boolean,
+    default: true
+  },
+  featured: {
+    type: Boolean,
+    default: false
+  },
+  discount: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 100
   }
-
-  // Enforce 60 character limit
-  this.name = this.name.split('').slice(0, 59);
-
-  // Handle slugs with potentially identical names
-  this.slug = slug(this.name);
-  const slugRegEx = new RegExp(`^(${this.slug})((-[0-9]*$)?)$`, 'i');
-
-  // this.constructor? Because you can't reference Product before it's created
-  const productsWithSlug = await this.constructor.find({ slug: slugRegEx });
-
-  if (productsWithSlug.length > 0) {
-    this.slug = `${this.slug}-${productsWithSlug.length + 1}`;
-  }
-
-  next();
+}, {
+  timestamps: true
 });
+
+// Index for search
+productSchema.index({ name: 'text', description: 'text' });
 
 module.exports = mongoose.model('Product', productSchema);

@@ -1,27 +1,187 @@
-const stripe = require('../constants/stripe');
-const { sendJson } = require('../handlers/util');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const Order = require('../models/Order');
+const Cart = require('../models/Cart');
+const Product = require('../models/Product');
 
-exports.processPayment = async (req, res) => {
-  const { amount, currency, description, email, source } = req.body;
+// Create payment intent
+exports.createPaymentIntent = async (req, res) => {
   try {
-    const customer = await stripe.customers.create({
-      email,
-      source
-    });
+    const { shippingAddress } = req.body;
 
-    const charge = await stripe.charges.create({
+    // Get user's cart
+    const cart = await Cart.findOne({ userId: req.user.id })
+      .populate('items.productId');
+
+    if (!cart || cart.items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cart is empty'
+      });
+    }
+
+    // Verify stock availability
+    for (const item of cart.items) {
+      const product = await Product.findById(item.productId._id);
+      if (product.stock < item.quantity) {
+        return res.status(400).json({
+          success: false,
+          message: `Insufficient stock for ${product.name}`
+        });
+      }
+    }
+
+    // Calculate total amount
+    const amount = Math.round(cart.totalPrice * 100); // Convert to cents
+
+    // Create Stripe payment intent
+    const paymentIntent = await stripe.paymentIntents.create({
       amount,
-      currency,
-      customer: customer.id,
-      description
+      currency: 'usd',
+      metadata: {
+        userId: req.user.id.toString(),
+        orderItems: JSON.stringify(cart.items.map(item => ({
+          productId: item.productId._id,
+          quantity: item.quantity
+        })))
+      }
     });
 
-    return sendJson(res, 200, {
-      message: 'Successfully processed payment.',
-      customerId: customer.id
+    // Create order
+    const order = await Order.create({
+      userId: req.user.id,
+      items: cart.items.map(item => ({
+        productId: item.productId._id,
+        name: item.productId.name,
+        quantity: item.quantity,
+        price: item.price,
+        image: item.productId.images[0]
+      })),
+      totalAmount: cart.totalPrice,
+      shippingAddress,
+      paymentInfo: {
+        stripePaymentIntentId: paymentIntent.id,
+        paymentStatus: 'pending'
+      }
     });
-  } catch (e) {
-    console.log(e);
-    return sendJson(res, 501, { message: 'Failed to process payment.' });
+
+    res.status(200).json({
+      success: true,
+      clientSecret: paymentIntent.client_secret,
+      orderId: order._id
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error creating payment intent',
+      error: error.message
+    });
   }
+};
+
+// Confirm payment
+exports.confirmPayment = async (req, res) => {
+  try {
+    const { orderId, paymentIntentId } = req.body;
+
+    // Verify payment with Stripe
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+
+    if (paymentIntent.status !== 'succeeded') {
+      return res.status(400).json({
+        success: false,
+        message: 'Payment not completed'
+      });
+    }
+
+    // Update order
+    const order = await Order.findById(orderId);
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+
+    order.paymentInfo.paymentStatus = 'completed';
+    order.orderStatus = 'processing';
+    order.statusHistory.push({
+      status: 'processing',
+      note: 'Payment completed successfully'
+    });
+
+    await order.save();
+
+    // Update product stock
+    for (const item of order.items) {
+      await Product.findByIdAndUpdate(item.productId, {
+        $inc: { stock: -item.quantity }
+      });
+    }
+
+    // Clear cart
+    await Cart.findOneAndUpdate(
+      { userId: req.user.id },
+      { items: [], totalPrice: 0 }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: 'Payment confirmed',
+      order
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error confirming payment',
+      error: error.message
+    });
+  }
+};
+
+// Webhook handler for Stripe events
+exports.stripeWebhook = async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle the event
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      const paymentIntent = event.data.object;
+      // Update order status
+      await Order.findOneAndUpdate(
+        { 'paymentInfo.stripePaymentIntentId': paymentIntent.id },
+        {
+          'paymentInfo.paymentStatus': 'completed',
+          orderStatus: 'processing'
+        }
+      );
+      break;
+
+    case 'payment_intent.payment_failed':
+      const failedIntent = event.data.object;
+      await Order.findOneAndUpdate(
+        { 'paymentInfo.stripePaymentIntentId': failedIntent.id },
+        {
+          'paymentInfo.paymentStatus': 'failed',
+          orderStatus: 'cancelled'
+        }
+      );
+      break;
+
+    default:
+      console.log(`Unhandled event type ${event.type}`);
+  }
+
+  res.json({ received: true });
 };
